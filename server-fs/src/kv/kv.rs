@@ -104,6 +104,11 @@ impl KV {
         self.manager.write().set(&key, 0, 0, value, 0);
     }
 
+    pub fn deleete_extra_value(&self, key: String) {
+        let key = format!("e:{}", key);
+        self.manager.write().delete(&key, 0, 0, 0);
+    }
+
     pub fn background_gc(&self) {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(10));

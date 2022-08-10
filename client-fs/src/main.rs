@@ -1,6 +1,7 @@
 mod disk;
 mod fake_disk;
 mod disk_manager;
+mod remote_disk_manager;
 
 use axum::{
     routing::post,
