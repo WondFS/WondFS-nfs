@@ -161,8 +161,7 @@ impl TranslationLayer {
             buf.copy_from_slice(&data[..buf.len()]);
             return;
         }
-        let data = self.disk_manager.read().disk_read(address);
-        buf.copy_from_slice(&data[..buf.len()]);
+        self.disk_manager.read().disk_read_advanced(address, buf);
     }
 
     pub fn write(&self, address: u32, data: &[u8; 4096]) {

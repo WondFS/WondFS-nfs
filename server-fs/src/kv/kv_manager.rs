@@ -4,13 +4,13 @@ use alloc::sync::Arc;
 use std::cmp::max;
 use std::cmp::min;
 use crate::buf;
+use crate::compress::compress;
 use super::gc::gc_manager;
 use super::component::bit;
 use super::component::pit;
 use super::component::journal;
 use super::component::super_block;
 use super::lsm_tree::lsm_tree;
-// use serde::{Serialize, Deserialize};
 use rkyv::ser::{Serializer, serializers::AllocSerializer};
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -23,8 +23,10 @@ pub enum KVOperationsObject {
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone, Copy)]
 pub struct DataObjectValueEntry {
     pub len: usize,
+    pub archived_len: usize,
     pub offset: usize,
     pub page_pointer: u32,
+    pub compress_type: u8,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
@@ -41,6 +43,7 @@ pub struct KVManager {
     pub journal: journal::Journal,
     pub buf: Arc<RwLock<buf::BufCache>>,
     pub lsm_tree: lsm_tree::LSMTree,
+    pub compress_manager: compress::CompressManager,
 }
 
 impl KVManager {
@@ -65,14 +68,11 @@ impl KVManager {
                 }
                 let archived = unsafe { rkyv::archived_root::<DataObjectValue>(value.as_ref().unwrap()) };
                 let mut data_object: DataObjectValue = archived.deserialize(&mut rkyv::Infallible).unwrap();
-                // let mut data_object: DataObjectValue = serde_json::from_slice(&value.unwrap()).unwrap();
                 if len != 0 {
                     if off + len > data_object.size {
                         return Some(self.read_data_object_all(&mut data_object)[off..].to_vec());
                     }
-                    // KVManager::sort_data_object(&mut data_object);
                     let mut index = 0;
-                    // println!("{:?}", data_object.entries);
                     for (i, entry) in data_object.entries.iter().enumerate() {
                         if off < entry.offset {
                             index = i - 1;
@@ -145,7 +145,6 @@ impl KVManager {
                 } else {
                     let archived = unsafe { rkyv::archived_root::<DataObjectValue>(pre_value.as_ref().unwrap()) };
                     data_object = archived.deserialize(&mut rkyv::Infallible).unwrap();
-                    // data_object = serde_json::from_slice(&pre_value.unwrap()).unwrap();
                 }
                 if len == 0 {
                     self.recycle_data_obect_all(&mut data_object);
@@ -154,7 +153,6 @@ impl KVManager {
                 let mut serializer = AllocSerializer::<0>::default();
                 serializer.serialize_value(&data_object).unwrap();
                 let value = serializer.into_serializer().into_inner().to_vec();
-                // let value = serde_json::to_vec(&data_object).ok().unwrap();
                 self.lsm_tree.put(&key.as_bytes().to_vec(), &value);
                 Some(data_object.size)
             },
@@ -259,12 +257,15 @@ impl KVManager {
         if off > object.size {
             return;
         }
-        let size = (len - 1) / 4096 + 1;
+        let (value, compress_type) = self.compress_manager.encode(value);
+        let size = (value.len() - 1) / 4096 + 1;
         let page_pointer = self.find_write_pos(size);
         let new_entry = DataObjectValueEntry {
             len,
             offset: off,
             page_pointer,
+            compress_type,
+            archived_len: value.len(),
         };
         for i in 0..size {
             let start_index = 4096 * i;
@@ -281,6 +282,7 @@ impl KVManager {
         }
         let mut remove_list = vec![];
         let mut insert_index = -1;
+        let mut first_entry = None;
         let mut second_entry = None;
         for (index, entry) in object.entries.clone().iter().enumerate() {
             if entry.offset + entry.len <= new_entry.offset {
@@ -290,35 +292,50 @@ impl KVManager {
             }
             let valid_prev = max(0, new_entry.offset as i32 - entry.offset as i32) as usize;
             let valid_suffix = max(0, entry.offset as i32 + entry.len as i32 - new_entry.offset as i32 - new_entry.len as i32) as usize;
-            if valid_prev == 0 {
-                let size = (entry.len - 1) / 4096 + 1;
-                for i in 0..size as u32 {
-                    self.dirty_pit(entry.page_pointer + i);
+            remove_list.push(object.entries[index].page_pointer);
+            if insert_index == -1 {
+                insert_index = index as i32;
+            }
+            if valid_prev != 0 {
+                let data = self.read_data_object_entry(entry);
+                let data = data[..valid_prev].to_vec();
+                let (data, compress_type) = self.compress_manager.encode(&data);
+                let size = (data.len() - 1) / 4096 + 1;
+                let page_pointer = self.find_write_pos(size);
+                let new_entry = DataObjectValueEntry {
+                    len: valid_prev,
+                    offset: entry.offset,
+                    page_pointer,
+                    compress_type,
+                    archived_len: data.len(),
+                };
+                for i in 0..size {
+                    let start_index = 4096 * i;
+                    let end_index = 4096 * (i + 1);
+                    if i == size - 1 {
+                        let mut data = data[start_index..].to_vec();
+                        data.extend(vec![10; 4096 - data.len()]);
+                        self.write_page(page_pointer + i as u32, &self.trans(data), true);
+                    } else {
+                        self.write_page(page_pointer + i as u32, &self.trans(data[start_index..end_index].to_vec()), true);
+                    }
+                    self.update_bit(page_pointer + i as u32, true);
+                    self.update_pit(page_pointer + i as u32, ino);
                 }
-                remove_list.push(object.entries[index].page_pointer);
-                if insert_index == -1 {
-                    insert_index = index as i32;
-                }
-            } else {
-                let size = (entry.len - 1) / 4096 + 1;
-                let o_size = (valid_prev - 1) / 4096 + 1;
-                for i in o_size as u32..size as u32 {
-                    self.dirty_pit(entry.page_pointer + i);
-                }
-                object.entries[index].len = valid_prev;
-                if insert_index == -1 {
-                    insert_index = (index + 1) as i32;
-                }
+                first_entry = Some(new_entry);
             }
             if valid_suffix > 0 {
                 let data = self.read_data_object_entry(entry);
                 let data = data[data.len()-valid_suffix..].to_vec();
-                let size = (valid_suffix - 1) / 4096 + 1;
+                let (data, compress_type) = self.compress_manager.encode(&data);
+                let size = (data.len() - 1) / 4096 + 1;
                 let page_pointer = self.find_write_pos(size);
                 let new_entry = DataObjectValueEntry {
                     len: valid_suffix,
                     offset: entry.offset + entry.len - valid_suffix,
                     page_pointer,
+                    compress_type,
+                    archived_len: data.len(),
                 };
                 for i in 0..size {
                     let start_index = 4096 * i;
@@ -335,6 +352,10 @@ impl KVManager {
                 }
                 second_entry = Some(new_entry);
             }
+            let size = (entry.archived_len - 1) / 4096 + 1;
+            for i in 0..size as u32 {
+                self.dirty_pit(entry.page_pointer + i);
+            }
         }
         for pointer in remove_list.iter() {
             for i in 0..object.entries.len() {
@@ -347,16 +368,10 @@ impl KVManager {
         if insert_index == -1 {
             insert_index = object.entries.len() as i32;
         }
-        // if insert_index == 0 {
-        //     if object.entries.len() == 0 {
-        //         object.entries.push(new_entry);
-        //     } else {
-        //         object.entries.insert(0, object.entries[0]);
-        //         object.entries[0] = new_entry;
-        //     }
-        // } else {
-        //     object.entries.insert((insert_index - 1) as usize, new_entry);
-        // }
+        if first_entry.is_some() {
+            object.entries.insert(insert_index as usize, first_entry.unwrap());
+            insert_index += 1;
+        }
         object.entries.insert(insert_index as usize, new_entry);
         if second_entry.is_some() {
             object.entries.insert(insert_index as usize + 1, second_entry.unwrap());
@@ -366,7 +381,6 @@ impl KVManager {
             len += entry.len;
         }
         object.size = len;
-        // KVManager::sort_data_object(object);
     }
 
     pub fn delete_data_object(&mut self, object: &mut DataObjectValue, off: usize, len: usize, ino: u32) {
@@ -375,6 +389,7 @@ impl KVManager {
         }
         let mut remove_list = vec![];
         let mut insert_index = -1;
+        let mut first_entry = None;
         let mut second_entry = None;
         for (index, entry) in object.entries.clone().iter().enumerate() {
             if entry.offset + entry.len <= off {
@@ -385,35 +400,73 @@ impl KVManager {
             } else {
                 let valid_prev = max(0, off as i32 - entry.offset as i32) as usize;
                 let valid_suffix = max(0, entry.offset as i32 + entry.len as i32 - off as i32 - len as i32) as usize;
-                if valid_prev == 0 {
-                    let size = (entry.len - 1) / 4096 + 1;
-                    for i in 0..size as u32 {
-                        self.dirty_pit(entry.page_pointer + i);
+                if entry.compress_type == 0 {
+                    if valid_prev == 0 {
+                        let size = (entry.len - 1) / 4096 + 1;
+                        for i in 0..size as u32 {
+                            self.dirty_pit(entry.page_pointer + i);
+                        }
+                        remove_list.push(object.entries[index].page_pointer);
+                        if insert_index == -1 {
+                            insert_index = index as i32;
+                        }
+                    } else {
+                        let size = (entry.len - 1) / 4096 + 1;
+                        let o_size = (valid_prev - 1) / 4096 + 1;
+                        for i in o_size as u32..size as u32 {
+                            self.dirty_pit(entry.page_pointer + i);
+                        }
+                        object.entries[index].len = valid_prev;
+                        if insert_index == -1 {
+                            insert_index = (index + 1) as i32;
+                        }
                     }
+                } else {
                     remove_list.push(object.entries[index].page_pointer);
                     if insert_index == -1 {
                         insert_index = index as i32;
                     }
-                } else {
-                    let size = (entry.len - 1) / 4096 + 1;
-                    let o_size = (valid_prev - 1) / 4096 + 1;
-                    for i in o_size as u32..size as u32 {
-                        self.dirty_pit(entry.page_pointer + i);
-                    }
-                    object.entries[index].len = valid_prev;
-                    if insert_index == -1 {
-                        insert_index = (index + 1) as i32;
+                    if valid_prev != 0 {
+                        let data = self.read_data_object_entry(entry);
+                        let data = data[..valid_prev].to_vec();
+                        let (data, compress_type) = self.compress_manager.encode(&data);
+                        let size = (data.len() - 1) / 4096 + 1;
+                        let page_pointer = self.find_write_pos(size);
+                        let new_entry = DataObjectValueEntry {
+                            len: valid_prev,
+                            offset: entry.offset,
+                            page_pointer,
+                            compress_type,
+                            archived_len: data.len(),
+                        };
+                        for i in 0..size {
+                            let start_index = 4096 * i;
+                            let end_index = 4096 * (i + 1);
+                            if i == size - 1 {
+                                let mut data = data[start_index..].to_vec();
+                                data.extend(vec![10; 4096 - data.len()]);
+                                self.write_page(page_pointer + i as u32, &self.trans(data), true);
+                            } else {
+                                self.write_page(page_pointer + i as u32, &self.trans(data[start_index..end_index].to_vec()), true);
+                            }
+                            self.update_bit(page_pointer + i as u32, true);
+                            self.update_pit(page_pointer + i as u32, ino);
+                        }
+                        first_entry = Some(new_entry);
                     }
                 }
                 if valid_suffix > 0 {
                     let data = self.read_data_object_entry(entry);
                     let data = data[data.len()-valid_suffix..].to_vec();
-                    let size = (valid_suffix - 1) / 4096 + 1;
+                    let (data, compress_type) = self.compress_manager.encode(&data);
+                    let size = (data.len() - 1) / 4096 + 1;
                     let page_pointer = self.find_write_pos(size);
                     let new_entry = DataObjectValueEntry {
                         len: valid_suffix,
                         offset: entry.offset + entry.len - valid_suffix,
                         page_pointer,
+                        compress_type,
+                        archived_len: data.len(),
                     };
                     for i in 0..size {
                         let start_index = 4096 * i;
@@ -430,6 +483,12 @@ impl KVManager {
                     }
                     second_entry = Some(new_entry);
                 }
+                if entry.compress_type != 0 {
+                    let size = (entry.archived_len - 1) / 4096 + 1;
+                    for i in 0..size as u32 {
+                        self.dirty_pit(entry.page_pointer + i);
+                    }
+                }
             }
         }
         for pointer in remove_list.iter() {
@@ -440,16 +499,10 @@ impl KVManager {
                 }
             }
         }
-        // if insert_index == 0 {
-        //     if object.entries.len() == 0 {
-        //         object.entries.push(second_entry.unwrap());
-        //     } else {
-        //         object.entries.insert(0, object.entries[0]);
-        //         object.entries[0] = second_entry.unwrap();
-        //     }
-        // } else {
-        //     object.entries.insert((insert_index - 1) as usize, second_entry.unwrap());
-        // }
+        if first_entry.is_some() {
+            object.entries.insert(insert_index as usize, first_entry.unwrap());
+            insert_index += 1;
+        }
         if second_entry.is_some() {
             object.entries.insert(insert_index as usize, second_entry.unwrap());
         }
@@ -458,13 +511,11 @@ impl KVManager {
             len += entry.len;
         }
         object.size = len;
-        // KVManager::sort_data_object(object);
     }
 }
 
 impl KVManager {
     pub fn read_data_object_all(&mut self, object: &mut DataObjectValue) -> Vec<u8> {
-        // KVManager::sort_data_object(object);
         let mut result = vec![];
         for entry in object.entries.iter() {
             result.append(&mut self.read_data_object_entry(entry));
@@ -473,30 +524,24 @@ impl KVManager {
     }
 
     pub fn read_data_object_entry(&mut self, entry: &DataObjectValueEntry) -> Vec<u8> {
-        let mut data = vec![0; entry.len];
+        let mut data = vec![0; entry.archived_len];
         let mut size = 0;
-        for i in 0..(entry.len-1)/4096+1 {
-            // let page_data = self.read_page(entry.page_pointer + i as u32, true);
-            if i == (entry.len-1)/4096 {
-                let remain_num = entry.len - size;
-                // for j in 0..remain_num {
-                //     data[size + j] = page_data[j];
-                // }
+        for i in 0..(entry.archived_len-1)/4096+1 {
+            if i == (entry.archived_len-1)/4096 {
+                let remain_num = entry.archived_len - size;
                 self.read_page_advanced(entry.page_pointer + i as u32, true, &mut data[size..size+remain_num]);
             } else {
-                // for j in 0..4096 {
-                //     data[size + j] = page_data[j];
-                // }
                 self.read_page_advanced(entry.page_pointer + i as u32, true, &mut data[size..size+4096]);
                 size += 4096;
             }
         }
+        let data = self.compress_manager.decode(&data, entry.compress_type);
         data
     }
 
     pub fn recycle_data_obect_all(&mut self, object: &mut DataObjectValue) {
         for entry in object.entries.iter() {
-            let size = (entry.len - 1) / 4096 + 1;
+            let size = (entry.archived_len - 1) / 4096 + 1;
             for i in 0..size as u32 {
                 self.dirty_pit(entry.page_pointer + i);
             }

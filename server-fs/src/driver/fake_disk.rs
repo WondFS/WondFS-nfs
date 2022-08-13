@@ -1,3 +1,6 @@
+use crate::kv::component::super_block::*;
+use rkyv::ser::{Serializer, serializers::AllocSerializer};
+
 pub struct FakeDisk {
     pub size: u32,
     pub block_num: u32,
@@ -14,6 +17,32 @@ impl FakeDisk {
             data.push([0; 4096]);
         }
         let block_num = size / 128;
+        let kv_ratio = 0.15;
+        let main_ratio = 0.6;
+        let super_stat = SuperStat {
+            magic_code: MAGICNUMBER,
+            block_num: block_num as u32,
+            super_block_num: 1,
+            bit_block_num: 2,
+            pit_block_num: 2,
+            journal_block_num: 1,
+            kv_block_num: (block_num as f64 * kv_ratio) as u32,
+            main_area_block_num:(block_num as f64 * main_ratio) as u32,
+            reserved_block_num: block_num as u32 - 6 - (block_num as f64 * kv_ratio) as u32 - (block_num as f64 * main_ratio) as u32,
+            page_size: 4096,
+            page_num_per_block: 128,
+        };
+        let mut serializer = AllocSerializer::<0>::default();
+        serializer.serialize_value(&super_stat).unwrap();
+        let mut stat_data = serializer.into_serializer().into_inner().to_vec();
+        let len = stat_data.len();
+        let mut stat_len: [u8; 4]  = [0; 4];
+        stat_len[0] = (len >> 24) as u8;
+        stat_len[1] = (len >> 16) as u8;
+        stat_len[2] = (len >> 8) as u8;
+        stat_len[3] = len as u8;
+        data[0][0..4].copy_from_slice(&stat_len);
+        data[0][4..4+len].copy_from_slice(&stat_data);
         FakeDisk {
             size,
             data,

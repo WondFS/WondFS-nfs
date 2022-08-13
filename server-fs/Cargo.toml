@@ -12,3 +12,4 @@ spin = "0.9"
 fuser = "0.7"
 libc = "0.2"
 rkyv = { version = "0.7", features = ["validation"] }
+snap = "1"

@@ -40,7 +40,7 @@ impl BufCache {
         }
         self.translation_layer.read_advanced(address, buf);
         let mut data = [0; 4096];
-        data.copy_from_slice(buf);
+        data[..buf.len()].copy_from_slice(buf);
         self.table.insert(address, data);
     }
 

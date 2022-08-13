@@ -29,10 +29,10 @@ impl WondFS {
         let kv = KV::new(Arc::clone(&tl));
         kv.mount();
         let kv = Arc::new(kv);
-        let a_kv = kv.clone();
-        thread::spawn( move || {
-            a_kv.background_gc();
-        });
+        // let a_kv = kv.clone();
+        // thread::spawn( move || {
+        //     a_kv.background_gc();
+        // });
         let inode_manager = InodeManager::new(Arc::clone(&kv));
         WondFS {
             tl,

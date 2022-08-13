@@ -24,23 +24,14 @@ pub fn dir_link(inode: &inode::Inode, ino: u32, name: String) {
     if dir_lookup(&inode, name.clone()).is_some() {
         return;
     }
-    let mut buf = vec![];
-    inode.read_all(&mut buf);
-    let iter = DirectoryParser::new(&buf);
-    let mut index = 0;
-    let per_size = iter.per_size;
-    for entry in iter {
-        if entry.ino == 0 {
-            break;
-        }
-        index += 1;
-    }
+    let index = inode.stat.read().size / 259;
     let entry = DirectoryInodeEntry {
         file_name: name,
         ino,
     };
     let buf = DirectoryParser::encode(&entry).unwrap();
-    inode.write(index * per_size, per_size, &buf)
+    // println!("{:?}", buf);
+    inode.write(index as usize * 259, 259, &buf)
 }
 
 pub fn dir_unlink(inode: &inode::Inode, ino: u32, name: String) {
@@ -82,6 +73,7 @@ pub struct DirectoryParser {
 
 impl DirectoryParser {
     pub fn new(data: &Vec<u8>) -> DirectoryParser {
+        // println!("{:?}", data);
         if data.len() % 259 != 0 {
             panic!("DirectoryParser: new not matched size");
         }

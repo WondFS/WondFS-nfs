@@ -5,6 +5,7 @@ use rkyv::ser::serializers::AllocSerializer;
 use spin::RwLock;
 use alloc::sync::Arc;
 use crate::buf;
+use crate::compress::compress;
 use crate::tl::tl;
 use crate::util::array::array;
 use super::gc::gc_manager;
@@ -27,6 +28,7 @@ impl KVManager {
             gc: gc_manager::GCManager::new(),
             journal: journal::Journal::new(),
             super_stat: super_block::SuperStat::new(),
+            compress_manager: compress::CompressManager::new(),
         }
     }
 
@@ -136,8 +138,19 @@ impl KVManager {
 
 impl KVManager {
     pub fn read_sb(&mut self) {
-        let data = self.read_block(0, false);
-        // self.super_stat.build(&data);
+        let data = self.read_page(0, false);
+        let byte1 = (data[0] as u32) << 24;
+        let byte2 = (data[1] as u32) << 16;
+        let byte3 = (data[2] as u32) << 8;
+        let byte4 = data[3] as u32;
+        let len = byte1 | byte2 | byte3 | byte4;
+        let data = data[4..4+len as usize].to_vec();
+        let archived = unsafe { rkyv::archived_root::<super_block::SuperStat>(&data) };
+        let stat: super_block::SuperStat = archived.deserialize(&mut rkyv::Infallible).ok().unwrap();
+        self.super_stat = stat;
+        if self.super_stat.magic_code != super_block::MAGICNUMBER {
+            panic!("SuperStat: build error");
+        }
     }
 }
 
